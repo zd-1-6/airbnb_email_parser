@@ -5,6 +5,8 @@ import glob
 import os
 import re
 import sys
+import base64
+import json
 from email import policy
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
@@ -14,6 +16,117 @@ try:
 except Exception:
     BeautifulSoup = None  # type: ignore
 
+try:
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    GMAIL_AVAILABLE = True
+except ImportError:
+    GMAIL_AVAILABLE = False
+
+# Gmail API scopes
+SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+
+def authenticate_gmail():
+    """Authenticate with Gmail API using OAuth2"""
+    if not GMAIL_AVAILABLE:
+        print("Gmail libraries not available. Install with: pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client")
+        return None
+    
+    creds = None
+    token_file = 'token.json'
+    
+    # Load existing credentials
+    if os.path.exists(token_file):
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+    
+    # If no valid credentials, get new ones
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            # Check for credentials.json file
+            if not os.path.exists('credentials.json'):
+                print("Gmail credentials not found. Please follow these steps:")
+                print("1. Go to https://console.developers.google.com/")
+                print("2. Create a new project or select existing one")
+                print("3. Enable Gmail API")
+                print("4. Create OAuth 2.0 credentials (Desktop application)")
+                print("5. Download credentials.json and place in this directory")
+                return None
+            
+            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        
+        # Save credentials for next run
+        with open(token_file, 'w') as token:
+            token.write(creds.to_json())
+    
+    return creds
+
+def get_gmail_service():
+    """Get authenticated Gmail service"""
+    creds = authenticate_gmail()
+    if not creds:
+        return None
+    
+    try:
+        service = build('gmail', 'v1', credentials=creds)
+        return service
+    except Exception as e:
+        print(f"Error creating Gmail service: {e}")
+        return None
+
+def search_airbnb_emails(service):
+    """Search for unread Airbnb confirmation emails"""
+    try:
+        # Search for unread emails from automated@airbnb.com with subject containing 'Reservation confirmed -'
+        query = 'from:automated@airbnb.com subject:"Reservation confirmed -" is:unread'
+        results = service.users().messages().list(userId='me', q=query).execute()
+        messages = results.get('messages', [])
+        
+        if not messages:
+            print("No unread Airbnb confirmation emails found.")
+            return []
+        
+        print(f"Found {len(messages)} unread Airbnb confirmation email(s)")
+        return messages
+    except HttpError as error:
+        print(f"Error searching emails: {error}")
+        return []
+
+def get_email_content(service, message_id):
+    """Get email content by message ID"""
+    try:
+        message = service.users().messages().get(userId='me', id=message_id, format='raw').execute()
+        raw_data = message['raw']
+        msg_bytes = base64.urlsafe_b64decode(raw_data)
+        return BytesParser(policy=policy.default).parsebytes(msg_bytes)
+    except HttpError as error:
+        print(f"Error getting email content: {error}")
+        return None
+
+def ask_gmail_permission():
+    """Ask user for permission to connect to Gmail"""
+    print("This script can connect to your Gmail account to fetch Airbnb confirmation emails.")
+    print("This requires Gmail API access and will open a browser window for authentication.")
+    response = input("Do you want to connect to Gmail? (y/n): ").lower().strip()
+    return response in ['y', 'yes']
+
+def get_gmail_credentials():
+    """Get Gmail credentials from user"""
+    print("\nGmail Authentication Setup:")
+    print("1. Go to https://console.developers.google.com/")
+    print("2. Create a new project or select existing one")
+    print("3. Enable Gmail API")
+    print("4. Create OAuth 2.0 credentials (Desktop application)")
+    print("5. Download credentials.json and place in this directory")
+    print("\nPress Enter when you have placed credentials.json in this directory...")
+    input()
+
+# ... existing code ...
 
 def html_to_text(html: str) -> str:
     if not html:
@@ -31,7 +144,6 @@ def html_to_text(html: str) -> str:
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
-
 
 def message_to_text(msg) -> str:
     parts = []
@@ -60,7 +172,6 @@ def message_to_text(msg) -> str:
             parts.append(html_to_text(payload) if ctype == "text/html" else payload)
     return "\n\n".join(p.strip() for p in parts if isinstance(p, str) and p.strip())
 
-
 def parse_booked_at(date_header: str) -> str:
     if not date_header:
         return ""
@@ -72,7 +183,6 @@ def parse_booked_at(date_header: str) -> str:
         return dt_utc.replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return ""
-
 
 def parse_date_token(s: str) -> str:
     m = re.search(r"\b([A-Za-z]{3,9})\s+(\d{1,2})(?:,?\s*(\d{4}))?\b", s)
@@ -91,7 +201,6 @@ def parse_date_token(s: str) -> str:
             return ""
     return dt.strftime("%Y-%m-%d") + " 00:00:00"
 
-
 def find_confirmation_code(text: str) -> str:
     for pat in [
         r"\bCONFIRMATION CODE\s*\n([A-Z0-9]{6,})\b",
@@ -102,7 +211,6 @@ def find_confirmation_code(text: str) -> str:
         if m:
             return m.group(1).upper()
     return ""
-
 
 def find_dates(text: str) -> tuple[str, str]:
     # Normalize non-breaking spaces
@@ -150,7 +258,6 @@ def find_dates(text: str) -> tuple[str, str]:
 
     return "", ""
 
-
 def find_guest_breakdown(text: str) -> tuple[int, int, int]:
     adults = children = infants = 0
     m = re.search(r"\b(\d{1,2})\s+adults?\b", text, flags=re.I)
@@ -164,11 +271,9 @@ def find_guest_breakdown(text: str) -> tuple[int, int, int]:
         infants = int(m.group(1))
     return adults, children, infants
 
-
 def find_nights(text: str) -> int:
     m = re.search(r"\b(\d{1,3})\s+nights?\b", text, flags=re.I)
     return int(m.group(1)) if m else 0
-
 
 def money_first_number_after(label_pat: str, text: str) -> float:
     sec = re.search(label_pat, text, flags=re.I)
@@ -177,7 +282,6 @@ def money_first_number_after(label_pat: str, text: str) -> float:
     after = text[sec.end() : sec.end() + 200]
     m = re.search(r"([\d][\d,]*\.?\d{2})", after)
     return float(m.group(1).replace(",", "")) if m else 0.0
-
 
 def find_numbers(text: str) -> dict:
     per_night = 0.0
@@ -203,7 +307,6 @@ def find_numbers(text: str) -> dict:
         h_cleaning_fee=cleaning_fee,
         h_service_fee=h_service_fee,
     )
-
 
 def find_listing_name(text: str) -> str:
     def looks_like_url_or_tracking(s: str) -> bool:
@@ -257,7 +360,6 @@ def find_listing_name(text: str) -> str:
 
     return ""
 
-
 def find_guest_name_from_subject(subject: str) -> str:
     if not subject:
         return ""
@@ -271,15 +373,12 @@ def find_guest_name_from_subject(subject: str) -> str:
     )
     return m2.group(1).strip() if m2 else ""
 
-
 def find_earnings_from_you_earn(text: str) -> float:
     m = re.search(r"\bYou\s+earn\b[^\d]{0,80}?([\d][\d,]*\.?\d{2})", text, flags=re.I | re.S)
     return float(m.group(1).replace(",", "")) if m else 0.0
 
-
 def sql_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "''")
-
 
 def build_insert(row: dict) -> str:
     cols = [
@@ -336,10 +435,8 @@ def build_insert(row: dict) -> str:
     ]
     return "INSERT INTO `airbnb_reservations` (`" + "`, `".join(cols) + "`) VALUES\n(" + ", ".join(vals) + ");"
 
-
-def parse_file(path: str) -> str:
-    with open(path, "rb") as f:
-        msg = BytesParser(policy=policy.default).parsebytes(f.read())
+def parse_message(msg) -> str:
+    """Parse email message object (works for both .eml files and Gmail messages)"""
     text = message_to_text(msg)
     subject = msg.get("Subject", "") or ""
     booked = parse_booked_at(msg.get("Date", ""))
@@ -376,12 +473,83 @@ def parse_file(path: str) -> str:
     }
     return build_insert(row)
 
+def parse_file(path: str) -> str:
+    """Parse .eml file (legacy function)"""
+    with open(path, "rb") as f:
+        msg = BytesParser(policy=policy.default).parsebytes(f.read())
+    return parse_message(msg)
+
+def process_gmail_emails():
+    """Process emails from Gmail"""
+    if not ask_gmail_permission():
+        return False
+    
+    if not GMAIL_AVAILABLE:
+        print("Installing required Gmail libraries...")
+        print("Run: pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client")
+        return False
+    
+    if not os.path.exists('credentials.json'):
+        get_gmail_credentials()
+        if not os.path.exists('credentials.json'):
+            print("credentials.json not found. Cannot proceed with Gmail integration.")
+            return False
+    
+    service = get_gmail_service()
+    if not service:
+        return False
+    
+    messages = search_airbnb_emails(service)
+    if not messages:
+        return True
+    
+    print(f"\nProcessing {len(messages)} email(s)...")
+    
+    for i, message in enumerate(messages):
+        try:
+            msg = get_email_content(service, message['id'])
+            if msg:
+                stmt = parse_message(msg)
+                sys.stdout.write(stmt)
+                if i < len(messages) - 1:
+                    sys.stdout.write("\n\n")
+                else:
+                    sys.stdout.write("\n")
+        except Exception as e:
+            sys.stderr.write(f"Failed to parse email {message['id']}: {e}\n")
+    
+    return True
 
 def main():
-    p = argparse.ArgumentParser(description="Parse Airbnb .eml files into SQL INSERTs")
-    p.add_argument("--input", "-i", nargs="+", required=True, help="Paths/globs to .eml files")
+    p = argparse.ArgumentParser(description="Parse Airbnb .eml files into SQL INSERTs or fetch from Gmail")
+    p.add_argument("--input", "-i", nargs="*", help="Paths/globs to .eml files (optional if using Gmail)")
+    p.add_argument("--gmail", "-g", action="store_true", help="Fetch emails from Gmail instead of .eml files")
     args = p.parse_args()
 
+    # If Gmail flag is set, process Gmail emails
+    if args.gmail:
+        if process_gmail_emails():
+            return
+        else:
+            sys.exit(1)
+    
+    # If no input files specified and no Gmail flag, ask user
+    if not args.input:
+        print("No input files specified. Choose an option:")
+        print("1. Process .eml files (specify with --input)")
+        print("2. Fetch from Gmail (use --gmail flag)")
+        choice = input("Enter choice (1 or 2): ").strip()
+        
+        if choice == "2":
+            if process_gmail_emails():
+                return
+            else:
+                sys.exit(1)
+        else:
+            print("Please specify .eml files with --input or use --gmail flag")
+            sys.exit(1)
+
+    # Process .eml files (original functionality)
     tokens = []
     for token in args.input:
         if any(ch in token for ch in "*?"):
@@ -408,7 +576,6 @@ def main():
             sys.stdout.write("\n" if idx == len(expanded) - 1 else "\n\n")
         except Exception as e:
             sys.stderr.write(f"Failed to parse {path}: {e}\n")
-
 
 if __name__ == "__main__":
     main()
